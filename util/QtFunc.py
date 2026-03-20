@@ -23,96 +23,45 @@ def list_images_in_directory(directory):
 
 # 修改照片大小
 def Change_image_Size(image_path):
-    # 打开原图像
+    """
+    生成用于显示的缩放图，但**不覆盖写入原始图片文件**。
+
+    之前的实现会把缩放后的图片直接保存回 image_path，导致：
+    - 图片实际分辨率被永久改写（例如 3200x1800 变成 1300x731）
+    - 其它标注软件再打开同名图片时，看到的是被改过尺寸的图片
+    - 从而出现“坐标变了/框错位”的现象
+    """
     original_image = Image.open(image_path)
-    # 获取照片大小
-    width, height = original_image.size
-    ratio = 1300 / width
-    width = 1300
-    height *= ratio
-    reduced_image = original_image.resize((int(width), int(height)))
-    if height > 850:
-        ratio = 850 / height
-        height = 850
-        width *= ratio
-        reduced_image = original_image.resize((int(width), int(height)))
-    reduced_image.save((image_path))
-    return image_path, int(width), int(height)
+    orig_w, orig_h = original_image.size
 
+    # 只缩小不放大：避免小图被强行拉伸
+    ratio = min(1300 / orig_w, 850 / orig_h, 1.0)
+    disp_w = int(orig_w * ratio)
+    disp_h = int(orig_h * ratio)
 
-def _get_image_size_from_xml(root, label_path):
-    """
-    根据 XML 中的 <path>/<folder>/<filename> 尝试找到实际图像，
-    返回该图像的 (width, height)。找不到则返回 (None, None)。
-    """
-    img_path = None
-    path_node = root.find("path")
-    if path_node is not None and path_node.text:
-        candidate = path_node.text
-        if os.path.exists(candidate):
-            img_path = candidate
+    reduced_image = original_image.resize((disp_w, disp_h))
 
-    if img_path is None:
-        folder_node = root.find("folder")
-        filename_node = root.find("filename")
-        if folder_node is not None and filename_node is not None:
-            candidate = os.path.join(folder_node.text, filename_node.text)
-            if os.path.exists(candidate):
-                img_path = candidate
-
-    if img_path is None:
-        filename_node = root.find("filename")
-        if filename_node is not None:
-            candidate = os.path.join(os.path.dirname(label_path), filename_node.text)
-            if os.path.exists(candidate):
-                img_path = candidate
-
-    if img_path is None:
-        return None, None
+    # 写入缓存目录，避免污染原图
+    cache_dir = os.path.join("GUI", ".cache_images")
+    os.makedirs(cache_dir, exist_ok=True)
+    base = os.path.basename(image_path)
+    name, ext = os.path.splitext(base)
+    cache_path = os.path.join(cache_dir, f"{name}_{disp_w}x{disp_h}{ext if ext else '.jpg'}")
 
     try:
-        with Image.open(img_path) as im:
-            return im.size
+        reduced_image.save(cache_path)
     except Exception:
-        return None, None
+        cache_path = os.path.join(cache_dir, f"{name}_{disp_w}x{disp_h}.png")
+        reduced_image.save(cache_path)
 
-
-def _get_scale_from_xml(label_path):
-    """
-    基于 XML 记录的 size 和当前图像真实尺寸，计算坐标缩放比例。
-    当 YOLO 在原始 3200x1800 上标注，而本项目把图像缩小到 1300xH 时，
-    会用该比例把标注同步缩放，保证坐标和当前图像对齐。
-    """
-    with open(label_path, "r") as file:
-        content = file.read()
-    root = ET.fromstring(content)
-
-    xml_w = xml_h = None
-    size_node = root.find("size")
-    if size_node is not None:
-        w_node = size_node.find("width")
-        h_node = size_node.find("height")
-        if w_node is not None and h_node is not None:
-            try:
-                xml_w = int(w_node.text)
-                xml_h = int(h_node.text)
-            except (TypeError, ValueError):
-                xml_w = xml_h = None
-
-    img_w, img_h = _get_image_size_from_xml(root, label_path)
-
-    if not xml_w or not xml_h or not img_w or not img_h:
-        return 1.0, 1.0, root
-
-    scale_x = img_w / float(xml_w)
-    scale_y = img_h / float(xml_h)
-    return scale_x, scale_y, root
+    # 返回：显示用图片路径、显示尺寸、原图尺寸
+    return cache_path, int(disp_w), int(disp_h), int(orig_w), int(orig_h)
 
 
 def list_label(label_path):
-    # 计算缩放比例并解析 XML
-    scale_x, scale_y, root = _get_scale_from_xml(label_path)
-
+    with open(label_path, 'r') as file:
+        content = file.read()
+    root = ET.fromstring(content)
     objects = root.findall('object')
 
     list_labels = []
@@ -124,12 +73,6 @@ def list_label(label_path):
         xmax = int(obj.find('bndbox/xmax').text)
         ymax = int(obj.find('bndbox/ymax').text)
 
-        # 把基于原始分辨率的坐标缩放到当前图像分辨率
-        xmin = int(round(xmin * scale_x))
-        ymin = int(round(ymin * scale_y))
-        xmax = int(round(xmax * scale_x))
-        ymax = int(round(ymax * scale_y))
-
         box = [xmin, ymin, xmax, ymax]
         list_labels.append(name)
         list_box.append(box)
@@ -137,8 +80,9 @@ def list_label(label_path):
 
 
 def get_labels(label_path):
-    # 同 list_label，一样做比例缩放，保证 bndbox 始终和当前图像尺寸一致
-    scale_x, scale_y, root = _get_scale_from_xml(label_path)
+    with open(label_path, 'r') as file:
+        content = file.read()
+    root = ET.fromstring(content)
 
     get_list_label = []
 
@@ -147,11 +91,6 @@ def get_labels(label_path):
         ymin = int(obj.find('bndbox/ymin').text)
         xmax = int(obj.find('bndbox/xmax').text)
         ymax = int(obj.find('bndbox/ymax').text)
-
-        xmin = int(round(xmin * scale_x))
-        ymin = int(round(ymin * scale_y))
-        xmax = int(round(xmax * scale_x))
-        ymax = int(round(ymax * scale_y))
 
         item = {
             'name': obj.find('name').text,

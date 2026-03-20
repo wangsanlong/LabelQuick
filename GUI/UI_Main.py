@@ -197,6 +197,12 @@ class Ui_MainWindow(object):
 
         self.verticalLayout.addWidget(self.listWidget)
 
+        # 编辑模式：避免遮挡误编辑（选中框后再点编辑/按E才能拖拽修改）
+        self.pushButton_edit = QtWidgets.QPushButton(self.layoutWidget)
+        self.pushButton_edit.setCheckable(True)
+        self.pushButton_edit.setObjectName("pushButton_edit")
+        self.verticalLayout.addWidget(self.pushButton_edit)
+
         # 标签管理按钮：删除选中标签 & 清空当前图像所有标签
         self.pushButton_delete_label = QtWidgets.QPushButton(self.layoutWidget)
         self.pushButton_delete_label.setObjectName("pushButton_delete_label")
@@ -210,6 +216,16 @@ class Ui_MainWindow(object):
         self.pushButton_tag_management = QtWidgets.QPushButton(self.layoutWidget)
         self.pushButton_tag_management.setObjectName("pushButton_tag_management")
         self.verticalLayout.addWidget(self.pushButton_tag_management)
+
+        # 标签统计：直接在主界面显示每类数量
+        self.label_stats_title = QtWidgets.QLabel(self.layoutWidget)
+        self.label_stats_title.setObjectName("label_stats_title")
+        self.verticalLayout.addWidget(self.label_stats_title)
+        self.label_stats_value = QtWidgets.QLabel(self.layoutWidget)
+        self.label_stats_value.setObjectName("label_stats_value")
+        self.label_stats_value.setAlignment(QtCore.Qt.AlignTop)
+        self.label_stats_value.setWordWrap(True)
+        self.verticalLayout.addWidget(self.label_stats_value)
         self.horizontalLayout_2.addWidget(self.splitter)
         self.horizontalLayout.addWidget(self.frame)
         MainWindow.setCentralWidget(self.centralwidget)
@@ -356,6 +372,9 @@ class Ui_MainWindow(object):
         self.pushButton_delete_label.setText(_translate("MainWindow", "删除选中标签"))
         self.pushButton_clear_labels.setText(_translate("MainWindow", "清空当前图像所有标签"))
         self.pushButton_tag_management.setText(_translate("MainWindow", "标签管理"))
+        self.label_stats_title.setText(_translate("MainWindow", "当前图像标签统计："))
+        self.label_stats_value.setText(_translate("MainWindow", "无"))
+        self.pushButton_edit.setText(_translate("MainWindow", "编辑：关（E）"))
         self.toolBar.setWindowTitle(_translate("MainWindow", "toolBar"))
         self.actionOpen_Dir.setText(_translate("MainWindow", "Open Dir"))
         self.actionOpen_Dir.setShortcut(_translate("MainWindow", "Ctrl+U"))

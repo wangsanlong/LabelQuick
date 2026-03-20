@@ -12,11 +12,12 @@ HISTORY_PATH = 'GUI/history.txt'
 
 
 class TagManagementDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, stats=None):
         super(TagManagementDialog, self).__init__(parent)
         self.setWindowTitle("标签管理")
         self.setMinimumSize(320, 360)
         self.history = []
+        self.stats = stats or {}
         self._setup_ui()
         self._load_history()
 
@@ -37,6 +38,11 @@ class TagManagementDialog(QDialog):
         add_layout.addWidget(btn_add)
         layout.addLayout(add_layout)
 
+        layout.addWidget(QLabel("标签统计（当前图像）："))
+        self.label_stats = QLabel("")
+        self.label_stats.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.label_stats)
+
         btn_layout = QHBoxLayout()
         btn_delete = QPushButton("删除选中")
         btn_delete.clicked.connect(self._delete_selected)
@@ -46,6 +52,14 @@ class TagManagementDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         btn_layout.addWidget(btn_close)
         layout.addLayout(btn_layout)
+        self._refresh_stats()
+
+    def _refresh_stats(self):
+        if not self.stats:
+            self.label_stats.setText("无")
+            return
+        lines = [f"{k}: {v}" for k, v in sorted(self.stats.items(), key=lambda kv: (-kv[1], kv[0]))]
+        self.label_stats.setText("\n".join(lines))
 
     def _load_history(self):
         self.history = []

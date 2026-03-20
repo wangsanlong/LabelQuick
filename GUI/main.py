@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, json
 import copy
 import xml.etree.ElementTree as ET
 from PyQt5 import QtGui, QtWidgets
@@ -83,6 +83,13 @@ class MainFunc(QMainWindow):
         # 监听 scrollArea 里的鼠标滚轮事件，用于 Ctrl+滚轮缩放
         self.ui.scrollArea.viewport().installEventFilter(self)
 
+        # 记忆上次打开的路径，并自动初始化图像选择控件
+        self.config_path = os.path.join("GUI", "last_paths.json")
+        self.last_image_dir = None
+        self.last_save_dir = None
+        self._load_last_paths()
+        self._init_image_selector()
+
         self.sld_video_pressed=False
 
 
@@ -99,12 +106,15 @@ class MainFunc(QMainWindow):
         self.cap = None
         self.video_path = None
 
-        # 当前图片原始尺寸（经过 Change_image_Size 之后的基准尺寸）
-        self.img_width = None
-        self.img_height = None
+        # 基准坐标系：原图尺寸；显示尺寸单独保存（避免写 XML/给别的软件时错位）
+        self.img_width = None    # 原图 width（基准）
+        self.img_height = None   # 原图 height（基准）
+        self.disp_width = None   # 显示用 width
+        self.disp_height = None  # 显示用 height
 
         # 手动矩形编辑 / 四点标注状态
         self.selected_rect_index = None
+        self.edit_enabled = False
         self.dragging_rect = False
         self.resizing_rect = False
         self.drag_start_disp = None
@@ -148,10 +158,12 @@ class MainFunc(QMainWindow):
         self.total_frames = 0
         self.current_frame = 0
 
-        # 连接标签管理按钮
+        # 连接标签管理 / 统计 与编辑按钮
         self.ui.pushButton_delete_label.clicked.connect(self.delete_selected_label)
         self.ui.pushButton_clear_labels.clicked.connect(self.clear_all_labels)
         self.ui.pushButton_tag_management.clicked.connect(self.open_tag_management)
+        self.ui.pushButton_edit.clicked.connect(self.toggle_edit_enabled)
+        self.ui.listWidget.currentRowChanged.connect(self.on_label_selected)
 
         # 连接四点标注动作
         self.ui.actionFour_Point_Box.triggered.connect(self.toggle_four_point_mode)
@@ -159,6 +171,8 @@ class MainFunc(QMainWindow):
 
         # 初始应用默认模式（SAM）
         self.apply_annotate_mode("sam")
+        # 尝试自动加载上次打开的目录（仅在 AT 等模块初始化完成后）
+        self._try_autoload_last_dir()
 
     def apply_annotate_mode(self, mode: str):
         """应用并保持当前标注模式，并同步工具栏勾选状态。"""
@@ -246,12 +260,13 @@ class MainFunc(QMainWindow):
         """
         if not pixmap:
             return
-        if self.img_width is None or self.img_height is None:
+        # zoom 的基准应为“显示尺寸”，而不是原图尺寸
+        if self.disp_width is None or self.disp_height is None:
             w = pixmap.width()
             h = pixmap.height()
         else:
-            w = self.img_width
-            h = self.img_height
+            w = self.disp_width
+            h = self.disp_height
 
         scaled_w = int(w * self.zoom_factor)
         scaled_h = int(h * self.zoom_factor)
@@ -303,11 +318,14 @@ class MainFunc(QMainWindow):
         if self.cap:
             self.timer_camera.stop()
             self.ui.listWidget.clear()  # 清空listWidget
-        self.directory = QtWidgets.QFileDialog.getExistingDirectory()
+        default_dir = self.last_image_dir if self.last_image_dir and os.path.isdir(self.last_image_dir) else ""
+        self.directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择图片目录", default_dir)
         if self.directory:
             self.undo_stack = []
             self.image_files = list_images_in_directory(self.directory)
             self.current_index = 0
+            self.last_image_dir = self.directory
+            self._save_last_paths()
             # 每次重新选择目录时重置缩放
             self.zoom_factor = 1.0
             self.show_path_image()
@@ -318,28 +336,43 @@ class MainFunc(QMainWindow):
             # 鼠标点击触发
             # 默认进入 SAM 分割模式并保持
             self.apply_annotate_mode("sam")
+            # 刷新下拉选择
+            self._populate_image_selector()
 
     def show_path_image(self):
         if self.image_files:
             self.image_path = self.image_files[self.current_index]
-            self.img_path = self.image_path
+            # image_path 为原图路径；img_path 为显示用缓存图路径
             self.image_name = os.path.basename(self.image_path).split('.')[0]
             # 更新 UI 显示当前图像名称并在后台打印
             base_name = os.path.basename(self.image_path)
             self.ui.label_image_name.setText(f"当前图像：{base_name}")
             print(f"当前标注图像：{base_name}")
 
-            # 调整图像大小到统一基准尺寸，并记录基准尺寸
-            self.img_path, self.img_width, self.img_height = Change_image_Size(self.img_path)
-            self.image = cv2.imread(self.img_path)
+            # 同步下拉与跳转控件选中项
+            if hasattr(self, "image_combo") and self.image_combo.count() > 0:
+                self.image_combo.blockSignals(True)
+                self.image_combo.setCurrentIndex(self.current_index)
+                self.image_combo.blockSignals(False)
+                if hasattr(self, "jump_spin"):
+                    self.jump_spin.setValue(self.current_index + 1)
+
+            # 生成显示用缩放图（不覆盖原图），并记录显示尺寸 + 原图尺寸（基准）
+            self.img_path, self.disp_width, self.disp_height, self.img_width, self.img_height = Change_image_Size(self.image_path)
+
+            # 标注基准：原图（SAM/四点/矩形存储与 XML 都在原图坐标系）
+            self.image = cv2.imread(self.image_path)
             self.AT.Set_Image(self.image)
-            # 保存当前 CV 图像用于缩放
-            self.current_cv_image = self.image.copy()
+
+            # 显示用：缩放后的图
+            self.current_cv_image = cv2.resize(self.image, (self.disp_width, self.disp_height))
             self.show_qt(self.img_path)
             self.Exists_Labels_And_Boxs()
 
     # 展示已保存所有标签
     def Exists_Labels_And_Boxs(self):
+        if not self.save_path:
+            return
         self.list_labels = []
         label_file = os.path.exists(f"{self.save_path}/{self.image_name}.xml")
         if label_file:
@@ -350,6 +383,8 @@ class MainFunc(QMainWindow):
             self.Show_Exists()
             for label in self.list_labels:
                 self.ui.listWidget.addItem(label)
+        # 每次加载/刷新标签后更新右侧统计
+        self._update_stats_label()
 
     def show_qt(self, img_path):
         if img_path != None:
@@ -357,7 +392,7 @@ class MainFunc(QMainWindow):
             self.update_display_with_pixmap(Qt_Gui)
 
     def next_img(self):
-        if self.img_path and not self.clicked_event and not self.paint_event:
+        if self.img_path:
             if self.image_files and self.current_index < len(self.image_files) - 1:
                 self.current_index += 1
                 print(self.current_index)
@@ -366,19 +401,23 @@ class MainFunc(QMainWindow):
                 upWindowsh("这是最后一张")
 
     def prev_img(self):
-        if self.img_path and not self.clicked_event and not self.paint_event:
+        if self.img_path:
             if self.image_files and self.current_index > 0:
                 self.current_index -= 1
                 self.Other_Img()
-                
             else:
                 upWindowsh("这是第一张")
                 
     def Other_Img(self):
+        # 重置本图的临时状态，允许在未保存时也能切换图片
         self.undo_stack = []
         self.labels = []
         self.paint_save = []
         self.clicked_save = []
+        self.clicked_event = False
+        self.paint_event = False
+        self.pending_four_point_rect = None
+        self.selected_rect_index = None
         self.ui.listWidget.clear()
         # 切换图片时重置缩放
         self.zoom_factor = 1.0
@@ -387,9 +426,12 @@ class MainFunc(QMainWindow):
         self.apply_annotate_mode(self.annotate_mode)
 
     def set_save_path(self):
-        directory = QtWidgets.QFileDialog.getExistingDirectory()
+        default_dir = self.last_save_dir if self.last_save_dir and os.path.isdir(self.last_save_dir) else ""
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择保存目录", default_dir)
         if directory:
             self.save_path = directory
+            self.last_save_dir = directory
+            self._save_last_paths()
             if self.img_path:
                 self.Exists_Labels_And_Boxs()
 
@@ -435,8 +477,20 @@ class MainFunc(QMainWindow):
 # 重写QWidget类的keyPressEvent方法
     def keyPressEvent(self, event):
         if self.img_path:
+            # E：切换编辑开关（避免遮挡误编辑）
+            if event.key() == Qt.Key_E and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier)):
+                self.ui.pushButton_edit.setChecked(not self.ui.pushButton_edit.isChecked())
+                self.toggle_edit_enabled()
+                return
+            # Ctrl+S：全局保存当前图像（写回 XML）
+            if event.key() == Qt.Key_S and (event.modifiers() & Qt.ControlModifier):
+                self.global_save_current_image()
+                return
             # Alt+S：为当前框自动使用第一个标签（优先处理，避免触发普通 S 逻辑）
             if event.key() == Qt.Key_S and (event.modifiers() & Qt.AltModifier):
+                # 忽略按键自动重复，避免 Alt+S 长按导致多次确认
+                if event.isAutoRepeat():
+                    return
                 if self.ui.listWidget.count() > 0 and (self.clicked_event or self.paint_event):
                     first_item = self.ui.listWidget.item(0)
                     if first_item:
@@ -485,7 +539,30 @@ class MainFunc(QMainWindow):
                         self.ui.label_4.mousePressEvent = self.mouse_press_event
                         self.ui.label_4.setCursor(Qt.ArrowCursor)
 
-                
+            # Q：删除当前选中的矩形框及对应标签
+            if event.key() == Qt.Key_Q and self.selected_rect_index is not None and not self.video_path:
+                idx = self.selected_rect_index
+                if 0 <= idx < len(self.labels):
+                    self.push_undo()
+                    # 删除 labels / paint_save 中对应项
+                    self.labels.pop(idx)
+                    if 0 <= idx < len(self.paint_save):
+                        self.paint_save.pop(idx)
+                    # 重建右侧标签列表
+                    self.ui.listWidget.clear()
+                    self.list_labels = [item.get("name", "") for item in self.labels]
+                    for name in self.list_labels:
+                        self.ui.listWidget.addItem(name)
+                    # 重写 XML
+                    xml_file = os.path.join(self.save_path, f"{self.image_name}.xml")
+                    if not self.labels:
+                        if os.path.exists(xml_file):
+                            os.remove(xml_file)
+                    else:
+                        xml(self.image_path, xml_file, [self.img_width, self.img_height, 3], self.labels)
+                    self.selected_rect_index = None
+                    self.Show_Exists()
+                    return
 
             # Backspace：清空当前图像的所有标签（保持原有逻辑）
             if event.key() == 16777219:
@@ -528,8 +605,17 @@ class MainFunc(QMainWindow):
     def on_dialog_confirmed(self, text):
         if not self.save_path:
             upWindowsh("请选择保存路径")
+            return
 
-        elif text and self.clicked_event:
+        clicked = bool(self.clicked_event)
+        paint = bool(self.paint_event)
+        if not text or (not clicked and not paint):
+            return
+        # 先把状态置空，避免 Alt+S 键重复触发时重复添加标签
+        if clicked:
+            self.clicked_event = False
+
+        if text and clicked:
             self.push_undo()
             self.ui.listWidget.addItem(text)
             result, file_path, size = xml_message(self.save_path, self.image_name, self.img_width, self.img_height,
@@ -537,55 +623,79 @@ class MainFunc(QMainWindow):
             self.labels.append(result)
             self.clicked_save.append([self.AT.x, self.AT.y, (self.AT.w + self.AT.x), (self.AT.h + self.AT.y)])
             xml(self.image_path, file_path, size, self.labels)
-
-        elif text and self.paint_event:
+            self._update_stats_label()
+        elif text and paint:
             self.push_undo()
-            self.paint_event = False
+            # 保存矩形后仍保持矩形/四点模式可继续画框
             self.clicked_event = True
-            self.ui.listWidget.addItem(text)
 
-            # 四点标注：直接使用 pending_four_point_rect；否则从显示坐标转换
-            if getattr(self, 'pending_four_point_rect', None):
-                r = self.pending_four_point_rect
-                x0_base, y0_base, x1_base, y1_base = r[0], r[1], r[2], r[3]
-                self.pending_four_point_rect = None
+            # 情况一：正在编辑已有矩形（selected_rect_index 有效）
+            if self.selected_rect_index is not None and 0 <= self.selected_rect_index < len(self.labels):
+                idx = self.selected_rect_index
+                # 优先使用当前 paint_save 中的坐标（已经包含拖拽/缩放后的结果）
+                if 0 <= idx < len(self.paint_save):
+                    x0_base, y0_base, x1_base, y1_base = self.paint_save[idx]
+                else:
+                    x0_base, y0_base, x1_base, y1_base = self.labels[idx]["bndbox"]
+                # 更新标签与框
+                self.labels[idx]["name"] = text
+                self.labels[idx]["bndbox"] = [x0_base, y0_base, x1_base, y1_base]
+                if 0 <= idx < len(self.paint_save):
+                    self.paint_save[idx] = [x0_base, y0_base, x1_base, y1_base]
+                # 更新右侧标签文本
+                if 0 <= idx < self.ui.listWidget.count():
+                    self.ui.listWidget.item(idx).setText(text)
+
+            # 情况二：新建矩形（包括四点标注）
             else:
-                x0_base = self.x0
-                y0_base = self.y0
-                x1_base = self.x1
-                y1_base = self.y1
-                if self.img_width and self.img_height:
-                    disp_w = self.ui.label_3.width()
-                    disp_h = self.ui.label_3.height()
-                    if disp_w > 0 and disp_h > 0:
-                        scale_x = self.img_width / float(disp_w)
-                        scale_y = self.img_height / float(disp_h)
-                        x0_base = int(self.x0 * scale_x)
-                        y0_base = int(self.y0 * scale_y)
-                        x1_base = int(self.x1 * scale_x)
-                        y1_base = int(self.y1 * scale_y)
+                # 四点标注：直接使用 pending_four_point_rect；否则从显示坐标转换
+                if getattr(self, 'pending_four_point_rect', None):
+                    r = self.pending_four_point_rect
+                    x0_base, y0_base, x1_base, y1_base = r[0], r[1], r[2], r[3]
+                    self.pending_four_point_rect = None
+                else:
+                    x0_base = self.x0
+                    y0_base = self.y0
+                    x1_base = self.x1
+                    y1_base = self.y1
+                    if self.img_width and self.img_height:
+                        disp_w = self.ui.label_3.width()
+                        disp_h = self.ui.label_3.height()
+                        if disp_w > 0 and disp_h > 0:
+                            scale_x = self.img_width / float(disp_w)
+                            scale_y = self.img_height / float(disp_h)
+                            x0_base = int(self.x0 * scale_x)
+                            y0_base = int(self.y0 * scale_y)
+                            x1_base = int(self.x1 * scale_x)
+                            y1_base = int(self.y1 * scale_y)
+                # 新建矩形：追加一条 label + 框
+                self.ui.listWidget.addItem(text)
+                result, file_path, size = xml_message(
+                    self.save_path,
+                    self.image_name,
+                    self.img_width,
+                    self.img_height,
+                    text,
+                    x0_base,
+                    y0_base,
+                    abs(x1_base - x0_base),
+                    abs(y1_base - y0_base),
+                )
+                self.labels.append(result)
+                self.paint_save.append([x0_base, y0_base, x1_base, y1_base])
 
-            result, file_path, size = xml_message(
-                self.save_path,
-                self.image_name,
-                self.img_width,
-                self.img_height,
-                text,
-                x0_base,
-                y0_base,
-                abs(x1_base - x0_base),
-                abs(y1_base - y0_base),
-            )
-            self.labels.append(result)
-            self.paint_save.append([x0_base, y0_base, x1_base, y1_base])
-            xml(self.image_path, file_path, size, self.labels)
+            # 统一写回 XML（labels 为真相源）
+            xml_file = os.path.join(self.save_path, f"{self.image_name}.xml")
+            xml(self.image_path, xml_file, [self.img_width, self.img_height, 3], self.labels)
+            self._update_stats_label()
 
             # 确认后保持当前模式（不强制切回 SAM）
             self.apply_annotate_mode(self.annotate_mode)
             
         self.clicked_event = False
-        self.paint_event = False
-
+        # 保持当前标注方式：rect/four 继续处于 paint_event，使第二个框可以直接保存
+        self.paint_event = self.annotate_mode in ("rect", "four")
+        self.save = True  # 允许继续绘制下一框
         self.Show_Exists()
 
     def video_on_dialog_confirmed(self, text):
@@ -610,8 +720,10 @@ class MainFunc(QMainWindow):
 
     # 显示已存在框
     def Show_Exists(self):
-        image = cv2.imread(self.img_path)
+        # 以“原图”为底图，在原图坐标系画框后再缩放到显示尺寸
+        image = cv2.imread(self.image_path) if getattr(self, "image_path", None) else cv2.imread(self.img_path)
         if self.clicked_save == [] and self.paint_save == [] and not getattr(self, 'pending_four_point_rect', None):
+            # 仅显示缩放图
             self.show_qt(self.img_path)
         else:
             if self.clicked_save != []:
@@ -620,11 +732,25 @@ class MainFunc(QMainWindow):
             if self.paint_save != []:
                 for i in self.paint_save:
                     image = cv2.rectangle(image, (i[0], i[1]), (i[2], i[3]), (0, 0, 255), 2)
+            # 高亮当前选中框（与右侧标签索引一致）
+            if self.selected_rect_index is not None:
+                idx = self.selected_rect_index
+                box = None
+                if 0 <= idx < len(self.paint_save):
+                    box = self.paint_save[idx]
+                else:
+                    j = idx - len(self.paint_save)
+                    if 0 <= j < len(self.clicked_save):
+                        box = self.clicked_save[j]
+                if box:
+                    image = cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (0, 255, 255), 4)
             # 绘制四点待确认框（虚线效果用半透明或不同颜色区分）
             if getattr(self, 'pending_four_point_rect', None):
                 r = self.pending_four_point_rect
                 image = cv2.rectangle(image, (r[0], r[1]), (r[2], r[3]), (255, 165, 0), 2)
-            # 保存当前 CV 图像并按缩放比例显示
+            # 缩放到底显示尺寸再显示（保证框与显示图对齐）
+            if self.disp_width and self.disp_height:
+                image = cv2.resize(image, (self.disp_width, self.disp_height))
             self.current_cv_image = image.copy()
             self.update_display_with_image(self.current_cv_image)
 
@@ -760,10 +886,16 @@ class MainFunc(QMainWindow):
             disp_x, disp_y = event.pos().x(), event.pos().y()
             # 先检测是否点在已有矩形上，用于拖拽/缩放
             idx, role = self._hit_test_rect(disp_x, disp_y)
-            if idx is not None:
+            if idx is not None and self.edit_enabled:
+                # 编辑模式：点击已有矩形进行拖拽/缩放
                 self.selected_rect_index = idx
+                if 0 <= idx < self.ui.listWidget.count():
+                    self.ui.listWidget.setCurrentRow(idx)
                 self.drag_start_disp = (disp_x, disp_y)
-                self.drag_start_rect = self.paint_save[idx][:]
+                if 0 <= idx < len(self.paint_save):
+                    self.drag_start_rect = self.paint_save[idx][:]
+                else:
+                    self.drag_start_rect = None
                 if role == "inside":
                     self.dragging_rect = True
                     self.resizing_rect = False
@@ -771,15 +903,19 @@ class MainFunc(QMainWindow):
                     self.dragging_rect = False
                     self.resizing_rect = True
                 self.flag = False
-            else:
-                # 新建矩形
-                self.dragging_rect = False
-                self.resizing_rect = False
-                self.selected_rect_index = None
-                self.flag = True
-                self.show_qt(self.img_path)
-                self.x0, self.y0 = disp_x, disp_y
-                self.x1, self.y1 = self.x0, self.y0
+                self.ui.label_4.update()
+                return
+
+            # 走到这里有两种情况：
+            # 1）没点到任何已有矩形
+            # 2）点到了已有矩形，但编辑开关为关（此时允许从该点开始新建矩形）
+            self.dragging_rect = False
+            self.resizing_rect = False
+            self.selected_rect_index = None
+            self.flag = True
+            self.show_qt(self.img_path)
+            self.x0, self.y0 = disp_x, disp_y
+            self.x1, self.y1 = self.x0, self.y0
             self.ui.label_4.update()
 
     def mouseReleaseEvent(self, event):
@@ -800,7 +936,7 @@ class MainFunc(QMainWindow):
             # 正在新建矩形
             self.x1, self.y1 = disp_x, disp_y
             self.ui.label_4.update()
-        elif self.dragging_rect and self.selected_rect_index is not None and self.drag_start_rect is not None:
+        elif self.edit_enabled and self.dragging_rect and self.selected_rect_index is not None and self.drag_start_rect is not None:
             # 平移已有矩形（在基准坐标下平移）
             dx_disp = disp_x - self.drag_start_disp[0]
             dy_disp = disp_y - self.drag_start_disp[1]
@@ -811,7 +947,7 @@ class MainFunc(QMainWindow):
             new_rect = [x0 + dx_base, y0 + dy_base, x1 + dx_base, y1 + dy_base]
             self.paint_save[self.selected_rect_index] = new_rect
             self.Show_Exists()
-        elif self.resizing_rect and self.selected_rect_index is not None and self.drag_start_rect is not None:
+        elif self.edit_enabled and self.resizing_rect and self.selected_rect_index is not None and self.drag_start_rect is not None:
             # 简单缩放：只根据鼠标位移调整右下角
             dx_disp = disp_x - self.drag_start_disp[0]
             dy_disp = disp_y - self.drag_start_disp[1]
@@ -1071,14 +1207,238 @@ class MainFunc(QMainWindow):
         self.list_labels = []
         self.clicked_save = []
         self.paint_save = []
+        self._update_stats_label()
         self.show_qt(self.img_path)
         self.ui.label_4.mousePressEvent = self.mouse_press_event
         self.ui.label_4.setCursor(Qt.ArrowCursor)
 
     def open_tag_management(self):
         """打开标签管理对话框，管理 history.txt 中的标签"""
-        dlg = TagManagementDialog(self)
+        stats = self._build_stats()
+        dlg = TagManagementDialog(self, stats=stats)
         dlg.exec_()
+
+    def _build_stats(self):
+        """根据当前 labels 统计每个类别的框数量。"""
+        stats = {}
+        for item in self.labels:
+            name = item.get("name", "")
+            if name:
+                stats[name] = stats.get(name, 0) + 1
+        return stats
+
+    def _update_stats_label(self):
+        """在主界面右侧显示当前图像的标签统计。"""
+        stats = self._build_stats()
+        if not stats:
+            self.ui.label_stats_value.setText("无")
+            return
+        lines = [f"{k}: {v}" for k, v in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0]))]
+        self.ui.label_stats_value.setText("\n".join(lines))
+
+    def _sync_boxes_to_labels(self):
+        """把当前 paint_save / clicked_save 的框坐标同步回 labels（用于 Ctrl+S 全局保存）。"""
+        if self.labels is None:
+            return
+        # 优先同步 rect/four 编辑产生的 paint_save
+        if self.paint_save and len(self.paint_save) == len(self.labels):
+            for i in range(len(self.labels)):
+                self.labels[i]["bndbox"] = [
+                    int(self.paint_save[i][0]),
+                    int(self.paint_save[i][1]),
+                    int(self.paint_save[i][2]),
+                    int(self.paint_save[i][3]),
+                ]
+        elif self.clicked_save and len(self.clicked_save) == len(self.labels):
+            for i in range(len(self.labels)):
+                self.labels[i]["bndbox"] = [
+                    int(self.clicked_save[i][0]),
+                    int(self.clicked_save[i][1]),
+                    int(self.clicked_save[i][2]),
+                    int(self.clicked_save[i][3]),
+                ]
+
+    def global_save_current_image(self):
+        """Ctrl+S：将当前图像的 labels 写回 XML（会同步 paint_save 编辑结果）。"""
+        if not self.save_path or not self.image_name or not self.img_width or not self.img_height:
+            upWindowsh("请先选择保存路径并打开图像")
+            return
+        self._sync_boxes_to_labels()
+        xml_file = os.path.join(self.save_path, f"{self.image_name}.xml")
+        if not self.labels:
+            if os.path.exists(xml_file):
+                os.remove(xml_file)
+            return
+        xml(self.image_path, xml_file, [self.img_width, self.img_height, 3], self.labels)
+        self._update_stats_label()
+        self.Show_Exists()
+
+    # --------------------------
+    # 记忆路径 + 图像下拉/跳转
+    # --------------------------
+    def _load_last_paths(self):
+        """加载上次打开的目录/保存目录（用于下次自动打开默认路径）。"""
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.last_image_dir = data.get("last_image_dir")
+                self.last_save_dir = data.get("last_save_dir")
+        except Exception:
+            self.last_image_dir = None
+            self.last_save_dir = None
+
+        # 校验路径是否存在
+        if self.last_image_dir and not os.path.isdir(self.last_image_dir):
+            self.last_image_dir = None
+        if self.last_save_dir and not os.path.isdir(self.last_save_dir):
+            self.last_save_dir = None
+
+    def _save_last_paths(self):
+        """保存当前目录/保存目录，用于下次自动打开。"""
+        try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "last_image_dir": self.last_image_dir,
+                        "last_save_dir": self.last_save_dir,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+    def _init_image_selector(self):
+        """初始化图像下拉选择与跳转控件（不影响原有功能）。"""
+        # 确保有 verticalLayout_2
+        if not hasattr(self.ui, "verticalLayout_2"):
+            return
+
+        # 图像下拉
+        self.image_combo_label = QtWidgets.QLabel(self.ui.frame_2)
+        self.image_combo_label.setObjectName("image_combo_label")
+        self.image_combo_label.setText("图像下拉选择：")
+        self.ui.verticalLayout_2.addWidget(self.image_combo_label)
+
+        self.image_combo = QtWidgets.QComboBox(self.ui.frame_2)
+        self.image_combo.setObjectName("image_combo")
+        self.image_combo.setEnabled(False)
+        self.ui.verticalLayout_2.addWidget(self.image_combo)
+
+        # 跳转控件
+        self.jump_spin_label = QtWidgets.QLabel(self.ui.frame_2)
+        self.jump_spin_label.setObjectName("jump_spin_label")
+        self.jump_spin_label.setText("跳转到：")
+        self.ui.verticalLayout_2.addWidget(self.jump_spin_label)
+
+        self.jump_spin = QtWidgets.QSpinBox(self.ui.frame_2)
+        self.jump_spin.setObjectName("jump_spin")
+        self.jump_spin.setMinimum(1)
+        self.jump_spin.setEnabled(False)
+        self.ui.verticalLayout_2.addWidget(self.jump_spin)
+
+        self.jump_button = QtWidgets.QPushButton("跳转", self.ui.frame_2)
+        self.jump_button.setObjectName("jump_button")
+        self.jump_button.setEnabled(False)
+        self.ui.verticalLayout_2.addWidget(self.jump_button)
+
+        # 信号
+        self.image_combo.currentIndexChanged.connect(self._on_image_combo_changed)
+        self.jump_button.clicked.connect(self._on_jump_clicked)
+
+    def _populate_image_selector(self):
+        """根据当前目录图片列表刷新下拉与跳转范围。"""
+        if not self.image_files:
+            self.image_combo.setEnabled(False)
+            self.jump_spin.setEnabled(False)
+            self.jump_button.setEnabled(False)
+            return
+
+        block = self.image_combo.blockSignals(True)
+        self.image_combo.clear()
+        for p in self.image_files:
+            self.image_combo.addItem(os.path.basename(p))
+        self.image_combo.setCurrentIndex(self.current_index)
+        self.image_combo.blockSignals(block)
+
+        self.jump_spin.setMaximum(max(1, len(self.image_files)))
+        self.jump_spin.setValue(self.current_index + 1)
+        self.image_combo.setEnabled(True)
+        self.jump_spin.setEnabled(True)
+        self.jump_button.setEnabled(True)
+
+    def _on_image_combo_changed(self, idx: int):
+        if not self.image_files:
+            return
+        if idx < 0 or idx >= len(self.image_files):
+            return
+        if idx == self.current_index:
+            return
+        self.current_index = idx
+        self.Other_Img()
+
+    def _on_jump_clicked(self):
+        if not self.image_files:
+            return
+        target = self.jump_spin.value() - 1
+        if target < 0 or target >= len(self.image_files):
+            return
+        if target == self.current_index:
+            return
+        self.current_index = target
+        self.Other_Img()
+
+    def _try_autoload_last_dir(self):
+        """启动时尝试自动打开上次的图像目录（仅在路径存在且控件可用时）。"""
+        if not self.last_image_dir or not os.path.isdir(self.last_image_dir):
+            return
+        # 避免在 AT 未初始化时调用
+        if not hasattr(self, "AT"):
+            return
+
+        img_files = list_images_in_directory(self.last_image_dir)
+        if not img_files:
+            return
+
+        # 确保 label_4 存在（Open Dir 时由 UI 创建）
+        try:
+            self.ui.enableLabel4()
+        except Exception:
+            pass
+
+        self.directory = self.last_image_dir
+        self.image_files = img_files
+        self.current_index = 0
+        self.zoom_factor = 1.0
+        self.save_path = self.last_save_dir if self.last_save_dir and os.path.isdir(self.last_save_dir) else None
+
+        # 使能标注相关按钮
+        self.Change_Enable(method="MakeTag", state=True)
+        self.Change_Enable(method="ShowVideo", state=False)
+        self.ui.pushButton_start_marking.setEnabled(False)
+
+        self.apply_annotate_mode("sam")
+
+        # 选择并展示第一张
+        self.show_path_image()
+        # 刷新下拉
+        self._populate_image_selector()
+
+    def on_label_selected(self, row: int):
+        """选中右侧标签时，高亮对应框。"""
+        if row is None or row < 0:
+            self.selected_rect_index = None
+        else:
+            self.selected_rect_index = row
+        self.Show_Exists()
+
+    def toggle_edit_enabled(self):
+        """编辑开关：避免遮挡误编辑。"""
+        self.edit_enabled = bool(self.ui.pushButton_edit.isChecked())
+        self.ui.pushButton_edit.setText(f"编辑：{'开' if self.edit_enabled else '关'}（E）")
 
     def push_undo(self):
         """在修改当前图像标注前，将当前状态压入撤回栈（仅当有图像且已设保存路径时）。"""
@@ -1113,6 +1473,7 @@ class MainFunc(QMainWindow):
                 os.remove(xml_file)
         else:
             xml(self.image_path, xml_file, [self.img_width, self.img_height, 3], self.labels)
+        self._update_stats_label()
         self.Show_Exists()
 
     def Btn_Replay(self):
@@ -1169,16 +1530,19 @@ class MainFunc(QMainWindow):
                     self.ui.label_image_name.setText(f"当前图像：{base_name}")
                     print(f"当前标注图像：{base_name}")
 
-                    self.img_path, self.img_width, self.img_height = Change_image_Size(self.img_path)
-                    print(self.img_path, self.img_width, self.img_height)
-                    self.image = cv2.imread(self.img_path)
+                    self.img_path, self.disp_width, self.disp_height, self.img_width, self.img_height = Change_image_Size(self.image_path)
+                    print(self.img_path, self.disp_width, self.disp_height, self.img_width, self.img_height)
+
+                    # 标注基准：原图
+                    self.image = cv2.imread(self.image_path)
                     self.AT.Set_Image(self.image)
-                    # 保存当前 CV 图像并显示
-                    self.current_cv_image = self.image.copy()
+
+                    # 显示用：缩放图
+                    self.current_cv_image = cv2.resize(self.image, (self.disp_width, self.disp_height))
                     self.show_qt(self.img_path)
                 
-            # 鼠标点击触发
-            self.ui.label_4.mousePressEvent = self.mouse_press_event
+            # 进入默认 SAM 模式
+            self.apply_annotate_mode("sam")
         else:
             upWindowsh("请先选择视频和保存路径")
 
