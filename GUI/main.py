@@ -87,6 +87,7 @@ class MainFunc(QMainWindow):
         self.config_path = os.path.join("GUI", "last_paths.json")
         self.last_image_dir = None
         self.last_save_dir = None
+        self.last_image_basename = None  # 上次标注停留的图像文件名（含扩展名）
         self._load_last_paths()
         self._init_image_selector()
 
@@ -322,8 +323,13 @@ class MainFunc(QMainWindow):
         self.directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择图片目录", default_dir)
         if self.directory:
             self.undo_stack = []
+            prev_last_dir = self.last_image_dir
             self.image_files = list_images_in_directory(self.directory)
-            self.current_index = 0
+            # 再次打开同一图片目录时，自动跳到上次停留的那张图
+            if self.directory == prev_last_dir and self.last_image_basename:
+                self.current_index = self._find_last_image_index(self.image_files)
+            else:
+                self.current_index = 0
             self.last_image_dir = self.directory
             self._save_last_paths()
             # 每次重新选择目录时重置缩放
@@ -368,6 +374,7 @@ class MainFunc(QMainWindow):
             self.current_cv_image = cv2.resize(self.image, (self.disp_width, self.disp_height))
             self.show_qt(self.img_path)
             self.Exists_Labels_And_Boxs()
+            self._record_current_image_position()
 
     # 展示已保存所有标签
     def Exists_Labels_And_Boxs(self):
@@ -861,7 +868,9 @@ class MainFunc(QMainWindow):
     def _hit_test_rect(self, disp_x, disp_y, tolerance=6):
         """
         在显示坐标系下命中测试已有矩形。
-        返回 (index, role)，role in {'inside','edge','corner'}。
+        返回 (index, role)：
+          - role == 'inside' 表示点在矩形内部
+          - role in {'left','right','top','bottom','tl','tr','bl','br'} 表示点在对应边/角附近
         """
         if not self.paint_save:
             return None, None
@@ -877,6 +886,23 @@ class MainFunc(QMainWindow):
                 near_top = abs(disp_y - top) <= tolerance
                 near_bottom = abs(disp_y - bottom) <= tolerance
                 if (near_left or near_right) or (near_top or near_bottom):
+                    # 优先判角（同时命中两个边）
+                    if near_left and near_top:
+                        return idx, "tl"
+                    if near_right and near_top:
+                        return idx, "tr"
+                    if near_left and near_bottom:
+                        return idx, "bl"
+                    if near_right and near_bottom:
+                        return idx, "br"
+                    if near_left:
+                        return idx, "left"
+                    if near_right:
+                        return idx, "right"
+                    if near_top:
+                        return idx, "top"
+                    if near_bottom:
+                        return idx, "bottom"
                     return idx, "edge"
                 return idx, "inside"
         return None, None
@@ -893,15 +919,19 @@ class MainFunc(QMainWindow):
                     self.ui.listWidget.setCurrentRow(idx)
                 self.drag_start_disp = (disp_x, disp_y)
                 if 0 <= idx < len(self.paint_save):
-                    self.drag_start_rect = self.paint_save[idx][:]
+                    # 统一归一化，保证 left<=right, top<=bottom，后续缩放计算更稳定
+                    x0, y0, x1, y1 = self.paint_save[idx][:]
+                    self.drag_start_rect = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
                 else:
                     self.drag_start_rect = None
                 if role == "inside":
                     self.dragging_rect = True
                     self.resizing_rect = False
+                    self.resize_anchor = "inside"
                 else:
                     self.dragging_rect = False
                     self.resizing_rect = True
+                    self.resize_anchor = role  # 记录命中的边/角
                 self.flag = False
                 self.ui.label_4.update()
                 return
@@ -912,6 +942,7 @@ class MainFunc(QMainWindow):
             self.dragging_rect = False
             self.resizing_rect = False
             self.selected_rect_index = None
+            self.resize_anchor = None
             self.flag = True
             self.show_qt(self.img_path)
             self.x0, self.y0 = disp_x, disp_y
@@ -926,6 +957,7 @@ class MainFunc(QMainWindow):
             # 拖拽/缩放结束，刷新显示
             self.dragging_rect = False
             self.resizing_rect = False
+            self.resize_anchor = None
             self.drag_start_disp = None
             self.drag_start_rect = None
             self.Show_Exists()
@@ -948,15 +980,63 @@ class MainFunc(QMainWindow):
             self.paint_save[self.selected_rect_index] = new_rect
             self.Show_Exists()
         elif self.edit_enabled and self.resizing_rect and self.selected_rect_index is not None and self.drag_start_rect is not None:
-            # 简单缩放：只根据鼠标位移调整右下角
+            # 缩放已有矩形：根据命中的边/角调整对应边
             dx_disp = disp_x - self.drag_start_disp[0]
             dy_disp = disp_y - self.drag_start_disp[1]
             sx, sy = self._get_scale_factors()
             dx_base = int(dx_disp * sx)
             dy_base = int(dy_disp * sy)
-            x0, y0, x1, y1 = self.drag_start_rect
-            # 这里简单假设从右下角拖拽，实际中左上角固定
-            new_rect = [x0, y0, x1 + dx_base, y1 + dy_base]
+            left, top, right, bottom = self.drag_start_rect
+
+            anchor = self.resize_anchor
+            min_w = 1
+            min_h = 1
+
+            new_left, new_top, new_right, new_bottom = left, top, right, bottom
+
+            if anchor in ("left", "tl", "bl"):
+                new_left = left + dx_base
+            if anchor in ("right", "tr", "br"):
+                new_right = right + dx_base
+            if anchor in ("top", "tl", "tr"):
+                new_top = top + dy_base
+            if anchor in ("bottom", "bl", "br"):
+                new_bottom = bottom + dy_base
+
+            # 防止翻转/过小：保持“对边”不动，只做最小尺寸裁剪
+            if new_left > new_right - min_w:
+                if anchor in ("left", "tl", "bl"):
+                    new_left = new_right - min_w
+                else:
+                    new_right = new_left + min_w
+            if new_top > new_bottom - min_h:
+                if anchor in ("top", "tl", "tr"):
+                    new_top = new_bottom - min_h
+                else:
+                    new_bottom = new_top + min_h
+
+            # 可选边界约束：裁剪到原图范围（避免拖出显示区域后出现异常坐标）
+            if self.img_width and self.img_height:
+                max_x = self.img_width - 1
+                max_y = self.img_height - 1
+                new_left = max(0, min(new_left, max_x))
+                new_right = max(0, min(new_right, max_x))
+                new_top = max(0, min(new_top, max_y))
+                new_bottom = max(0, min(new_bottom, max_y))
+
+                # 再次保证最小宽高
+                if new_right < new_left + min_w:
+                    if anchor in ("right", "tr", "br"):
+                        new_right = new_left + min_w
+                    else:
+                        new_left = new_right - min_w
+                if new_bottom < new_top + min_h:
+                    if anchor in ("bottom", "bl", "br"):
+                        new_bottom = new_top + min_h
+                    else:
+                        new_top = new_bottom - min_h
+
+            new_rect = [new_left, new_top, new_right, new_bottom]
             self.paint_save[self.selected_rect_index] = new_rect
             self.Show_Exists()
 
@@ -1284,9 +1364,11 @@ class MainFunc(QMainWindow):
                     data = json.load(f)
                 self.last_image_dir = data.get("last_image_dir")
                 self.last_save_dir = data.get("last_save_dir")
+                self.last_image_basename = data.get("last_image_basename")
         except Exception:
             self.last_image_dir = None
             self.last_save_dir = None
+            self.last_image_basename = None
 
         # 校验路径是否存在
         if self.last_image_dir and not os.path.isdir(self.last_image_dir):
@@ -1303,6 +1385,7 @@ class MainFunc(QMainWindow):
                     {
                         "last_image_dir": self.last_image_dir,
                         "last_save_dir": self.last_save_dir,
+                        "last_image_basename": self.last_image_basename,
                     },
                     f,
                     ensure_ascii=False,
@@ -1310,6 +1393,22 @@ class MainFunc(QMainWindow):
                 )
         except Exception:
             pass
+
+    def _find_last_image_index(self, image_files):
+        """若列表中存在上次记录的文件名，返回其索引，否则 0。"""
+        if not image_files or not getattr(self, "last_image_basename", None):
+            return 0
+        for i, p in enumerate(image_files):
+            if os.path.basename(p) == self.last_image_basename:
+                return i
+        return 0
+
+    def _record_current_image_position(self):
+        """将当前图像文件名写入配置，便于下次启动恢复停留位置。"""
+        if not getattr(self, "image_path", None):
+            return
+        self.last_image_basename = os.path.basename(self.image_path)
+        self._save_last_paths()
 
     def _init_image_selector(self):
         """初始化图像下拉选择与跳转控件（不影响原有功能）。"""
@@ -1411,7 +1510,7 @@ class MainFunc(QMainWindow):
 
         self.directory = self.last_image_dir
         self.image_files = img_files
-        self.current_index = 0
+        self.current_index = self._find_last_image_index(img_files)
         self.zoom_factor = 1.0
         self.save_path = self.last_save_dir if self.last_save_dir and os.path.isdir(self.last_save_dir) else None
 
@@ -1422,7 +1521,7 @@ class MainFunc(QMainWindow):
 
         self.apply_annotate_mode("sam")
 
-        # 选择并展示第一张
+        # 选择并展示上次停留的图片（若无记录则首张）
         self.show_path_image()
         # 刷新下拉
         self._populate_image_selector()
