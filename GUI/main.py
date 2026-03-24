@@ -124,6 +124,7 @@ class MainFunc(QMainWindow):
         self.four_point_mode = False
         self.four_points = []
         self.pending_four_point_rect = None  # 四点待确认框，按 S 后才写入 paint_save
+        self.crosshair_pos = None  # 矩形标注辅助线中心点（显示坐标）
         # 标注模式：默认 sam。可选：'sam' | 'rect' | 'four'
         self.annotate_mode = "sam"
         # 撤回栈：仅对当前图像，每步保存 (image_name, labels, clicked_save, paint_save)
@@ -174,6 +175,9 @@ class MainFunc(QMainWindow):
         self.apply_annotate_mode("sam")
         # 尝试自动加载上次打开的目录（仅在 AT 等模块初始化完成后）
         self._try_autoload_last_dir()
+        # 开启鼠标追踪并处理离开事件（用于辅助线）
+        self.ui.label_4.setMouseTracking(True)
+        self.ui.label_4.leaveEvent = self.on_label4_leave_event
 
     def apply_annotate_mode(self, mode: str):
         """应用并保持当前标注模式，并同步工具栏勾选状态。"""
@@ -298,6 +302,43 @@ class MainFunc(QMainWindow):
         q_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         pixmap = QtGui.QPixmap.fromImage(q_image)
         self.update_display_with_pixmap(pixmap)
+
+    def _pan_view_horizontally(self, delta_px):
+        """仅移动视图（不切图）：水平平移 scrollArea。"""
+        bar = self.ui.scrollArea.horizontalScrollBar()
+        if bar is None:
+            return
+        bar.setValue(bar.value() + int(delta_px))
+
+    def _zoom_view_keyboard(self, zoom_in: bool):
+        """
+        键盘缩放（V 放大 / C 缩小）：
+        只调整当前视图缩放，不改变图像索引和标注数据。
+        """
+        # 与 Ctrl+滚轮保持同一缩放步长与边界
+        factor = 1.1 if zoom_in else (1.0 / 1.1)
+        new_zoom = self.zoom_factor * factor
+        new_zoom = max(0.2, min(5.0, new_zoom))
+        if abs(new_zoom - self.zoom_factor) < 1e-9:
+            return
+
+        # 尽量保持当前视口中心位置，缩放后体验更稳定
+        hbar = self.ui.scrollArea.horizontalScrollBar()
+        vbar = self.ui.scrollArea.verticalScrollBar()
+        old_h = hbar.value() + self.ui.scrollArea.viewport().width() / 2.0
+        old_v = vbar.value() + self.ui.scrollArea.viewport().height() / 2.0
+        ratio = new_zoom / self.zoom_factor if self.zoom_factor else 1.0
+
+        self.zoom_factor = new_zoom
+        if hasattr(self, "current_cv_image"):
+            self.update_display_with_image(self.current_cv_image)
+        else:
+            self.show_qt(self.img_path)
+
+        new_h = int(old_h * ratio - self.ui.scrollArea.viewport().width() / 2.0)
+        new_v = int(old_v * ratio - self.ui.scrollArea.viewport().height() / 2.0)
+        hbar.setValue(new_h)
+        vbar.setValue(new_v)
 
     def Change_Enable(self,method="",state=False):
         if method=="ShowVideo":
@@ -484,6 +525,23 @@ class MainFunc(QMainWindow):
 # 重写QWidget类的keyPressEvent方法
     def keyPressEvent(self, event):
         if self.img_path:
+            # 视图快捷键（无修饰键）：
+            # F 向左平移，G 向右平移，V 放大，C 缩小
+            # 仅改变视觉视图，不切换图片，不影响标注数据。
+            if not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier)):
+                if event.key() == Qt.Key_F:
+                    self._pan_view_horizontally(-80)
+                    return
+                if event.key() == Qt.Key_G:
+                    self._pan_view_horizontally(80)
+                    return
+                if event.key() == Qt.Key_V:
+                    self._zoom_view_keyboard(zoom_in=True)
+                    return
+                if event.key() == Qt.Key_C:
+                    self._zoom_view_keyboard(zoom_in=False)
+                    return
+
             # E：切换编辑开关（避免遮挡误编辑）
             if event.key() == Qt.Key_E and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier)):
                 self.ui.pushButton_edit.setChecked(not self.ui.pushButton_edit.isChecked())
@@ -793,7 +851,7 @@ class MainFunc(QMainWindow):
         self.paint_event = True
         self.clicked_event = False
         self.ui.label_4.mousePressEvent = self.fourPointMousePressEvent
-        self.ui.label_4.mouseMoveEvent = None
+        self.ui.label_4.mouseMoveEvent = self.fourPointMouseMoveEvent
         self.ui.label_4.mouseReleaseEvent = None
         self.ui.label_4.paintEvent = self.fourPointPaintEvent
         self.ui.label_4.setCursor(Qt.CrossCursor)
@@ -834,13 +892,45 @@ class MainFunc(QMainWindow):
     def fourPointPaintEvent(self, event):
         """四点模式下，在 label_4 上预览已点击的点。"""
         super(MainFunc, self).paintEvent(event)
+        painter = QPainter(self.ui.label_4)
+        self._draw_crosshair_guides(painter)
         if not self.four_points:
             return
-        painter = QPainter(self.ui.label_4)
         painter.setPen(QPen(Qt.red, 2, Qt.DotLine))
         for x_base, y_base in self.four_points:
             x_disp, y_disp = self._base_to_display(x_base, y_base)
             painter.drawEllipse(x_disp - 3, y_disp - 3, 6, 6)
+
+    def fourPointMouseMoveEvent(self, event):
+        """四点模式下仅刷新辅助线。"""
+        self.crosshair_pos = (event.pos().x(), event.pos().y())
+        self.ui.label_4.update()
+
+    def on_label4_leave_event(self, event):
+        """鼠标离开标注区域时隐藏辅助线。"""
+        self.crosshair_pos = None
+        self.ui.label_4.update()
+        try:
+            QtWidgets.QLabel.leaveEvent(self.ui.label_4, event)
+        except Exception:
+            pass
+
+    def _draw_crosshair_guides(self, painter):
+        """绘制随鼠标移动的横纵虚线辅助线。"""
+        if self.annotate_mode not in ("rect", "four"):
+            return
+        if not self.img_path or self.crosshair_pos is None:
+            return
+        x, y = self.crosshair_pos
+        w = self.ui.label_4.width()
+        h = self.ui.label_4.height()
+        if w <= 0 or h <= 0:
+            return
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return
+        painter.setPen(QPen(Qt.yellow, 1, Qt.DashLine))
+        painter.drawLine(0, y, w - 1, y)
+        painter.drawLine(x, 0, x, h - 1)
 
     def _get_scale_factors(self):
         """返回从显示坐标到基准图像坐标的缩放因子 (scale_x, scale_y)。"""
@@ -964,6 +1054,7 @@ class MainFunc(QMainWindow):
 
     def mouseMoveEvent(self, event):
         disp_x, disp_y = event.pos().x(), event.pos().y()
+        self.crosshair_pos = (disp_x, disp_y)
         if self.flag:
             # 正在新建矩形
             self.x1, self.y1 = disp_x, disp_y
@@ -1039,6 +1130,8 @@ class MainFunc(QMainWindow):
             new_rect = [new_left, new_top, new_right, new_bottom]
             self.paint_save[self.selected_rect_index] = new_rect
             self.Show_Exists()
+        else:
+            self.ui.label_4.update()
 
     def paintEvent(self, event):
         super(MainFunc, self).paintEvent(event)
@@ -1047,6 +1140,7 @@ class MainFunc(QMainWindow):
         # 绘制正在新建的矩形预览
         if self.flag and self.x0 != 0 and self.y0 != 0 and self.x1 != 0 and self.y1 != 0:
             painter.drawRect(QRect(self.x0, self.y0, abs(self.x1 - self.x0), abs(self.y1 - self.y0)))
+        self._draw_crosshair_guides(painter)
 
     def saveAndUpdate(self):
         try:
